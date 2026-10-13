@@ -5,6 +5,7 @@ import json
 import os
 import vobject
 
+from radicale import log
 from radicale import pathutils
 from radicale import item as radicale_item
 import radicale.storage.multifilesystem as storage
@@ -60,38 +61,60 @@ class Collection(storage.Collection, CollectionHrefMappingsMixin):
             self.decsync = Decsync(decsync_dir, sync_type, collection, own_app_id)
 
             def info_listener(path, datetime, key, value, extra):
-                if key == "name":
-                    extra._set_meta_key("D:displayname", value, update_decsync=False)
-                elif key == "deleted":
-                    if value:
-                        extra.delete(update_decsync=False)
-                elif key == "color":
-                    extra._set_meta_key("ICAL:calendar-color", value, update_decsync=False)
-                else:
-                    raise ValueError("Unknown info key " + key)
+                try:
+                    if key == "name":
+                        extra._set_meta_key("D:displayname", value, update_decsync=False)
+                    elif key == "deleted":
+                        if value:
+                            extra.delete(update_decsync=False)
+                    elif key == "color":
+                        extra._set_meta_key("ICAL:calendar-color", value, update_decsync=False)
+                    else:
+                        raise ValueError("Unknown info key " + key)
+                except Exception:
+                    # Exceptions raised here cross back into the native
+                    # libdecsync callback and are swallowed silently there,
+                    # so log loudly before re-raising or this failure is
+                    # invisible and the info entry is retried forever.
+                    log.logger.error(
+                        "radicale_storage_decsync: failed to process info "
+                        "entry (sync_type=%r, path=%r, key=%r)",
+                        sync_type, path, key, exc_info=True)
+                    raise
             self.decsync.add_listener(["info"], info_listener)
 
             def resources_listener(path, datetime, key, value, extra):
-                if len(path) != 1:
-                    raise ValueError("Invalid path " + str(path))
-                uid = path[0]
-                href = extra.get_href(uid)
-                if value is None:
-                    if extra._get(href) is not None:
-                        extra.delete(href, update_decsync=False)
-                else:
-                    vobject_item = vobject.readOne(value)
-                    if sync_type == "contacts":
-                        tag = "VADDRESSBOOK"
+                try:
+                    if len(path) != 1:
+                        raise ValueError("Invalid path " + str(path))
+                    uid = path[0]
+                    href = extra.get_href(uid)
+                    if value is None:
+                        if extra._get(href) is not None:
+                            extra.delete(href, update_decsync=False)
                     else:
-                        tag = "VCALENDAR"
-                    max_vevent_rrule_occurrence = extra._storage.configuration.get(
-                        "server", "max_vevent_rrule_occurrence")
-                    radicale_item.check_and_sanitize_items(
-                        [vobject_item], max_vevent_rrule_occurrence, tag=tag)
-                    item = radicale_item.Item(collection=extra, vobject_item=vobject_item, uid=uid)
-                    item.prepare()
-                    extra.upload(href, item, update_decsync=False)
+                        vobject_item = vobject.readOne(value)
+                        if sync_type == "contacts":
+                            tag = "VADDRESSBOOK"
+                        else:
+                            tag = "VCALENDAR"
+                        max_vevent_rrule_occurrence = extra._storage.configuration.get(
+                            "server", "max_vevent_rrule_occurrence")
+                        radicale_item.check_and_sanitize_items(
+                            [vobject_item], max_vevent_rrule_occurrence, tag=tag)
+                        item = radicale_item.Item(collection=extra, vobject_item=vobject_item, uid=uid)
+                        item.prepare()
+                        extra.upload(href, item, update_decsync=False)
+                except Exception:
+                    # Same reasoning as info_listener above: without this,
+                    # a failed import (e.g. an incompatible Radicale/plugin
+                    # version) never shows up in any log and just silently
+                    # keeps missing from storage on every retry.
+                    log.logger.error(
+                        "radicale_storage_decsync: failed to import resource "
+                        "entry (sync_type=%r, path=%r)",
+                        sync_type, path, exc_info=True)
+                    raise
             self.decsync.add_listener(["resources"], resources_listener)
 
             self.load_hrefs(sync_type)
